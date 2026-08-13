@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0}
+body{background:#000;overflow:hidden;font-family:monospace;color:#ccc}
+canvas{display:block}
+#overlay{position:fixed;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;pointer-events:none}
+#overlay.active{pointer-events:auto;background:rgba(0,0,0,0.9)}
+#overlay h1{font-size:28px;color:#9b7ec7;margin-bottom:10px;text-shadow:0 0 20px rgba(123,94,167,0.5)}
+#overlay p{color:#666;margin-bottom:6px;font-size:13px}
+#overlay button{background:none;border:2px solid #7b5ea7;color:#9b7ec7;padding:10px 30px;font-size:14px;font-family:monospace;cursor:pointer;margin-top:15px;border-radius:4px}
+#overlay button:hover{background:rgba(123,94,167,0.2)}
+#vrBtn{display:none}
+#stats{position:fixed;bottom:8px;left:8px;color:#444;font-size:11px;z-index:5}
+#roomTag{position:fixed;bottom:8px;right:8px;color:#555;font-size:11px;z-index:5}
+</style>
+</head>
+<body>
+<div id="overlay" class="active">
+  <h1>PROJECT BANISHED</h1>
+  <p>Gorilla Tag style movement in a dark facility</p>
+  <p style="color:#555;margin-top:10px">Controls: Push off surfaces with VR controllers</p>
+  <p style="color:#555">Swing opposite direction to move</p>
+  <button id="vrBtn">ENTER VR</button>
+  <button id="desktopBtn">PLAY DESKTOP</button>
+</div>
+<canvas id="c"></canvas>
+<div id="stats"></div>
+<div id="roomTag">SPAWN ROOM</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import {VRButton} from 'three/addons/webxr/VRButton.js';
+import {XRControllerModelFactory} from 'three/addons/webxr/XRControllerModelFactory.js';
+
+// --- Renderer ---
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=0.4;
+document.body.appendChild(renderer.domElement);
+
+// --- Scene ---
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x020208);
+scene.fog=new THREE.FogExp2(0x020208,0.35);
+
+// --- Camera ---
+const camera=new THREE.PerspectiveCamera(80,window.innerWidth/window.innerHeight,0.01,100);
+camera.position.set(0,1.6,0);
+
+// --- XR ---
+let xrSession=null;
+const overlay=document.getElementById('overlay');
+const vrBtn=document.getElementById('vrBtn');
+const desktopBtn=document.getElementById('desktopBtn');
+
+if(navigator.xr){
+  navigator.xr.isSessionSupported('immersive-vr').then(supported=>{
+    if(supported){
+      vrBtn.style.display='inline-block';
+      vrBtn.addEventListener('click',async()=>{
+        xrSession=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});
+        renderer.xr.setSession(xrSession);
+        overlay.classList.remove('active');
+        resetPlayer();
+      });
+    }
+  });
+}
+
+desktopBtn.addEventListener('click',()=>{
+  overlay.classList.remove('active');
+  renderer.xr.enabled=false;
+  initDesktopControls();
+});
+
+// --- VR Controllers ---
+const controllers=[];
+const gripControllers=[];
+const controllerGrips=new XRControllerModelFactory();
+
+for(let i=0;i<2;i++){
+  const ctrl=renderer.xr.getController(i);
+  ctrl.addEventListener('selectstart',()=>{onTriggerPress(i)});
+  ctrl.addEventListener('selectend',()=>{onTriggerRelease(i)});
+  scene.add(ctrl);
+
+  const grip=renderer.xr.getControllerGrip(i);
+  grip.add(controllerGrips.createControllerModel(grip));
+  scene.add(grip);
+
+  controllers.push({hand:new THREE.Vector3(),prevHand:new THREE.Vector3(),velocity:new THREE.Vector3(),active:false});
+  gripControllers.push(grip);
+
+  // Hand ray
+  const geo=new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,0,0),new THREE.Vector3(0,0,-3)
+  ]);
+  const mat=new THREE.LineBasicMaterial({color:0x9b7ec7,transparent:true,opacity:0.3});
+  const ray=new THREE.Line(geo,mat);
+  ctrl.add(ray);
+}
+
+const tempMatrix=new THREE.Matrix4();
+const raycaster=new THREE.Raycaster();
+
+function onTriggerPress(i){
+  controllers[i].active=true;
+}
+
+function onTriggerRelease(i){
+  controllers[i].active=false;
+}
+
+// --- Physics ---
+const player={
+  position:new THREE.Vector3(0,1.2,2),
+  velocity:new THREE.Vector3(0,0,0),
+  radius:0.25,
+  onGround:false,
+  yaw:0
+};
+
+const GRAVITY=-18;
+const MAX_SPEED=10;
+const FRICTION_GROUND=0.92;
+const FRICTION_AIR=0.998;
+const PUSH_FORCE=8;
+
+// --- Colliders ---
+const colliders=[];
+function addCollider(x,y,z,w,h,d){
+  colliders.push(new THREE.Box3(
+    new THREE.Vector3(x-w/2,y-h/2,z-d/2),
+    new THREE.Vector3(x+w/2,y+h/2,z+d/2)
+  ));
+}
+
+function addColliderMesh(mesh){
+  mesh.updateMatrixWorld(true);
+  const box=new THREE.Box3().setFromObject(mesh);
+  colliders.push(box);
+}
+
+// --- Materials ---
+function mat(r,g,b,roughness=0.8){
+  return new THREE.MeshStandardMaterial({
+    color:new THREE.Color(r,g,b),
+    roughness:roughness,
+    metalness:0.1
+  });
+}
+
+function glowMat(r,g,b){
+  return new THREE.MeshBasicMaterial({color:new THREE.Color(r,g,b)});
+}
+
+// --- Build Facility ---
+const SCALE=1;
+const S=SCALE;
+
+function wallMesh(x,y,z,w,h,d,m){
+  const geo=new THREE.BoxGeometry(w,h,d);
+  const mesh=new THREE.Mesh(geo,m||wallMat);
+  mesh.position.set(x,y,z);
+  mesh.castShadow=true;
+  mesh.receiveShadow=true;
+  scene.add(mesh);
+  addCollider(x,y,z,w,h,d);
+  return mesh;
+}
+
+const floorMat=mat(0.06,0.06,0.08,0.95);
+const ceilMat=mat(0.04,0.04,0.06,0.95);
+const wallMat=mat(0.08,0.08,0.12,0.85);
+const darkWallMat=mat(0.05,0.05,0.08,0.9);
+const redMat=mat(0.25,0.02,0.02,0.7);
+const platformMat=mat(0.07,0.07,0.1,0.8);
+
+// Floor
+const floorGeo=new THREE.PlaneGeometry(900*S,460*S);
+floorGeo.rotateX(-Math.PI/2);
+const floor=new THREE.Mesh(floorGeo,floorMat);
+floor.position.y=-0.05;
+floor.receiveShadow=true;
+scene.add(floor);
+addCollider(0,-0.5,0,900*S,1,460*S);
+
+// Ceiling
+const ceilGeo=new THREE.PlaneGeometry(900*S,460*S);
+ceilGeo.rotateX(Math.PI/2);
+const ceil=new THREE.Mesh(ceilGeo,ceilMat);
+ceil.position.y=3.5;
+ceil.receiveShadow=true;
+scene.add(ceil);
+addCollider(0,4,0,900*S,1,460*S);
+
+// Outer walls
+wallMesh(0,1.75,-230*S,900*S,3.5,0.3);
+wallMesh(0,1.75,230*S,900*S,3.5,0.3);
+wallMesh(-450*S,1.75,0,0.3,3.5,460*S);
+wallMesh(450*S,1.75,0,0.3,3.5,460*S);
+
+// Spawn divider (gap 80-200 from left)
+wallMesh(250*S,1.75,-105*S,0.3,3.5,250*S);
+wallMesh(250*S,1.75,155*S,0.3,3.5,200*S);
+
+// Pool room
+wallMesh(350*S,1.75,-105*S,0.3,3.5,250*S);
+wallMesh(540*S,1.75,-105*S,0.3,3.5,250*S);
+wallMesh(445*S,1.75,-155*S,190*S,3.5,0.3);
+
+// Shelf room
+wallMesh(90*S,1.75,250*S,180*S,3.5,0.3);
+wallMesh(175*S,1.75,350*S,0.3,3.5,200*S);
+
+// Lower hallway
+wallMesh(430*S,1.75,350*S,500*S,3.5,0.15);
+wallMesh(430*S,1.75,446*S,500*S,3.5,0.15);
+
+// Arena right
+wallMesh(650*S,1.75,-65*S,0.3,3.5,330*S);
+wallMesh(895*S,1.75,-65*S,0.3,3.5,330*S);
+wallMesh(772*S,1.75,196*S,250*S,3.5,0.15);
+
+// Red door corridor
+wallMesh(650*S,1.75,275*S,0.3,3.5,150*S,redMat);
+wallMesh(720*S,1.75,275*S,0.3,3.5,150*S,redMat);
+wallMesh(685*S,1.75,346*S,80*S,3.5,0.15,redMat);
+
+// Portal room
+wallMesh(730*S,1.75,350*S,0.3,3.5,200*S);
+wallMesh(815*S,1.75,250*S,170*S,3.5,0.3);
+wallMesh(815*S,1.75,446*S,170*S,3.5,0.3);
+
+// Platforms
+const plat1=wallMesh(360*S,0.6,130*S,100*S,0.15,8*S,platformMat);
+const plat2=wallMesh(550*S,0.4,110*S,100*S,0.12,8*S,platformMat);
+
+// Steps
+wallMesh(300*S,0.3,150*S,40*S,0.6,40*S,platformMat);
+wallMesh(300*S,0.75,150*S,40*S,0.3,40*S,platformMat);
+
+// Pillars
+function pillar(px,pz){
+  const m=wallMat;
+  wallMesh(px*S,1.75,pz*S,0.4,3.5,0.4,m);
+}
+pillar(120,100);pillar(120,200);pillar(300,100);pillar(300,200);
+pillar(500,100);pillar(500,200);pillar(700,100);pillar(700,200);
+
+// --- Portal glow ---
+const portalLight=new THREE.PointLight(0x3311aa,2,8);
+portalLight.position.set(790*S,2,345*S);
+scene.add(portalLight);
+
+const portalGeo=new THREE.BoxGeometry(0.2,2.5,5);
+const portalMesh=new THREE.Mesh(portalGeo,new THREE.MeshBasicMaterial({
+  color:0x2200aa,transparent:true,opacity:0.3
+}));
+portalMesh.position.set(790*S,1.5,345*S);
+scene.add(portalMesh);
+
+// Portal frame pillars
+wallMesh(790*S,1.5,310*S,0.3,2.8,0.3,darkWallMat);
+wallMesh(790*S,1.5,380*S,0.3,2.8,0.3,darkWallMat);
+
+// --- Lighting ---
+const ambientLight=new THREE.AmbientLight(0x111122,0.3);
+scene.add(ambientLight);
+
+const dirLight=new THREE.DirectionalLight(0x8866aa,0.4);
+dirLight.position.set(5,8,3);
+dirLight.castShadow=true;
+dirLight.shadow.mapSize.set(2048,2048);
+dirLight.shadow.camera.near=0.1;
+dirLight.shadow.camera.far=30;
+dirLight.shadow.camera.left=-15;
+dirLight.shadow.camera.right=15;
+dirLight.shadow.camera.top=15;
+dirLight.shadow.camera.bottom=-15;
+scene.add(dirLight);
+
+// Point lights for rooms
+function roomLight(x,y,z,color,intensity,distance){
+  const l=new THREE.PointLight(color,intensity,distance);
+  l.position.set(x,y,z);
+  scene.add(l);
+}
+
+roomLight(125*S,3,180*S,0x9b7ec7,0.8,8);
+roomLight(400*S,3,50*S,0x6688aa,0.6,10);
+roomLight(90*S,3,350*S,0x556688,0.5,8);
+roomLight(430*S,3,400*S,0x7788aa,0.5,12);
+roomLight(750*S,3,100*S,0x667799,0.6,10);
+roomLight(685*S,3,275*S,0xaa2222,0.4,6);
+roomLight(790*S,3,350*S,0x4422aa,1.0,10);
+
+// --- Hand visuals ---
+const handGeo=new THREE.SphereGeometry(0.04,8,8);
+const handMat=new THREE.MeshBasicMaterial({color:0x9b7ec7});
+const handGlowMat=new THREE.MeshBasicMaterial({color:0x6633aa,transparent:true,opacity:0.3});
+
+const handMeshL=new THREE.Mesh(handGeo,handMat);
+const handGlowL=new THREE.Mesh(new THREE.SphereGeometry(0.07,8,8),handGlowMat);
+handMeshL.add(handGlowL);
+scene.add(handMeshL);
+
+const handMeshR=new THREE.Mesh(handGeo,handMat);
+const handGlowR=new THREE.Mesh(new THREE.SphereGeometry(0.07,8,8),handGlowMat);
+handMeshR.add(handGlowR);
+scene.add(handMeshR);
+
+// --- Body mesh ---
+const bodyGeo=new THREE.SphereGeometry(0.2,12,12);
+const bodyMat=new THREE.MeshStandardMaterial({color:0x3a1d8e,roughness:0.8});
+const bodyMesh=new THREE.Mesh(bodyGeo,bodyMat);
+bodyMesh.castShadow=true;
+scene.add(bodyMesh);
+
+// Head
+const headGeo=new THREE.SphereGeometry(0.15,12,12);
+const headMat=new THREE.MeshStandardMaterial({color:0x3a1d8e,roughness:0.7});
+const headMesh=new THREE.Mesh(headGeo,headMat);
+headMesh.castShadow=true;
+scene.add(headMesh);
+
+// --- Desktop Controls ---
+let desktopMode=false;
+let desktopYaw=0,desktopPitch=0;
+let dMouseX=0,dMouseY=0;
+let keys={};
+
+function initDesktopControls(){
+  desktopMode=true;
+  document.addEventListener('mousemove',e=>{
+    dMouseX+=e.movementX;dMouseY+=e.movementY;
+  });
+  document.addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true});
+  document.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false});
+  renderer.domElement.requestPointerLock();
+}
+
+// --- Reset ---
+function resetPlayer(){
+  player.position.set(0,1.2,2);
+  player.velocity.set(0,0,0);
+  player.yaw=0;
+}
+
+// --- Push detection ---
+const prevControllerPos=[
+  new THREE.Vector3(),new THREE.Vector3()
+];
+
+function updateControllers(time,delta){
+  if(!renderer.xr.isPresenting)return;
+
+  for(let i=0;i<2;i++){
+    const ctrl=renderer.xr.getController(i);
+    if(!ctrl.visible)continue;
+
+    const worldPos=new THREE.Vector3();
+    ctrl.getWorldPosition(worldPos);
+
+    controllers[i].prevHand.copy(controllers[i].hand);
+    controllers[i].hand.copy(worldPos);
+
+    const hv=new THREE.Vector3().subVectors(controllers[i].hand,controllers[i].prevHand);
+    const hspd=hv.length();
+
+    // Check collision
+    let onSurface=false;
+    const handBox=new THREE.Box3(
+      new THREE.Vector3(worldPos.x-0.1,worldPos.y-0.1,worldPos.z-0.1),
+      new THREE.Vector3(worldPos.x+0.1,worldPos.y+0.1,worldPos.z+0.1)
+    );
+
+    for(const col of colliders){
+      if(handBox.intersectsBox(col)){
+        onSurface=true;
+        break;
+      }
+    }
+
+    // Push opposite to hand movement
+    if(onSurface&&hspd>0.003){
+      const force=Math.min(hspd*PUSH_FORCE*50,MAX_SPEED);
+      player.velocity.x-=(hv.x/hspd)*force;
+      player.velocity.y-=(hv.y/hspd)*force;
+      player.velocity.z-=(hv.z/hspd)*force;
+    }
+
+    // Update hand mesh
+    if(i===0)handMeshL.position.copy(worldPos);
+    else handMeshR.position.copy(worldPos);
+  }
+}
+
+// --- Desktop update ---
+function updateDesktop(delta){
+  if(!desktopMode)return;
+
+  desktopYaw-=dMouseX*0.002;
+  desktopPitch-=dMouseY*0.002;
+  if(desktopPitch>1.4)desktopPitch=1.4;
+  if(desktopPitch<-1.4)desktopPitch=-1.4;
+  dMouseX=0;dMouseY=0;
+
+  // Move hand based on mouse
+  const handDist=2.5;
+  const hx=Math.sin(desktopYaw)*Math.cos(desktopPitch)*handDist;
+  const hy=Math.sin(desktopPitch)*handDist;
+  const hz=Math.cos(desktopYaw)*Math.cos(desktopPitch)*handDist;
+
+  const handWorld=new THREE.Vector3(
+    player.position.x+hx,
+    player.position.y+hy,
+    player.position.z+hz
+  );
+
+  const hv=new THREE.Vector3().subVectors(handWorld,prevDesktopHand);
+  const hspd=hv.length();
+
+  let onSurface=false;
+  const handBox=new THREE.Box3(
+    new THREE.Vector3(handWorld.x-0.15,handWorld.y-0.15,handWorld.z-0.15),
+    new THREE.Vector3(handWorld.x+0.15,handWorld.y+0.15,handWorld.z+0.15)
+  );
+
+  for(const col of colliders){
+    if(handBox.intersectsBox(col)){
+      onSurface=true;
+      break;
+    }
+  }
+
+  if(onSurface&&hspd>0.005){
+    const force=Math.min(hspd*PUSH_FORCE*60,MAX_SPEED);
+    player.velocity.x-=(hv.x/hspd)*force;
+    player.velocity.y-=(hv.y/hspd)*force;
+    player.velocity.z-=(hv.z/hspd)*force;
+  }
+
+  prevDesktopHand.copy(handWorld);
+  handMeshL.position.copy(handWorld);
+
+  // WASD movement when not pushing
+  const moveSpeed=3;
+  const fwd=new THREE.Vector3(Math.sin(desktopYaw),0,Math.cos(desktopYaw));
+  const right=new THREE.Vector3(Math.cos(desktopYaw),0,-Math.sin(desktopYaw));
+
+  if(!onSurface){
+    if(keys['w'])player.velocity.addScaledVector(fwd,moveSpeed*delta);
+    if(keys['s'])player.velocity.addScaledVector(fwd,-moveSpeed*delta);
+    if(keys['a'])player.velocity.addScaledVector(right,-moveSpeed*delta);
+    if(keys['d'])player.velocity.addScaledVector(right,moveSpeed*delta);
+  }
+
+  if(keys[' '])player.velocity.y=6;
+}
+
+const prevDesktopHand=new THREE.Vector3();
+
+// --- Physics ---
+function updatePhysics(delta){
+  // Gravity
+  player.velocity.y+=GRAVITY*delta;
+
+  // Friction
+  if(player.onGround){
+    player.velocity.x*=FRICTION_GROUND;
+    player.velocity.z*=FRICTION_GROUND;
+  }else{
+    player.velocity.x*=FRICTION_AIR;
+    player.velocity.z*=FRICTION_AIR;
+  }
+
+  // Clamp speed
+  const hSpd=Math.sqrt(player.velocity.x**2+player.velocity.z**2);
+  if(hSpd>MAX_SPEED){
+    player.velocity.x*=MAX_SPEED/hSpd;
+    player.velocity.z*=MAX_SPEED/hSpd;
+  }
+  player.velocity.y=Math.max(-15,Math.min(12,player.velocity.y));
+
+  // Move XZ
+  player.position.x+=player.velocity.x*delta;
+  player.position.z+=player.velocity.z*delta;
+
+  const R=player.radius;
+  player.onGround=false;
+
+  for(const col of colliders){
+    if(player.position.x+R>col.min.x&&player.position.x-R<col.max.x&&
+       player.position.y+R>col.min.y&&player.position.y-R<col.max.y&&
+       player.position.z+R>col.min.z&&player.position.z-R<col.max.z){
+
+      const oL=(player.position.x+R)-col.min.x;
+      const oR=col.max.x-(player.position.x-R);
+      const oF=(player.position.z+R)-col.min.z;
+      const oB=col.max.z-(player.position.z-R);
+      const oT=(player.position.y+R)-col.min.y;
+      const oBot=col.max.y-(player.position.y-R);
+      const m=Math.min(oL,oR,oF,oB,oT,oBot);
+
+      if(m===oBot){player.position.y=col.max.y+R;if(player.velocity.y<0){player.velocity.y*=-0.08;player.velocity.x*=0.85;player.velocity.z*=0.85;player.onGround=true;}}
+      else if(m===oT){player.position.y=col.min.y-R;if(player.velocity.y>0)player.velocity.y*=-0.08;}
+      else if(m===oL){player.position.x=col.min.x-R;player.velocity.x*=-0.2;}
+      else if(m===oR){player.position.x=col.max.x+R;player.velocity.x*=-0.2;}
+      else if(m===oF){player.position.z=col.min.z-R;player.velocity.z*=-0.2;}
+      else if(m===oB){player.position.z=col.max.z+R;player.velocity.z*=-0.2;}
+    }
+  }
+
+  // Move Y
+  player.position.y+=player.velocity.y*delta;
+
+  for(const col of colliders){
+    if(player.position.x+R>col.min.x&&player.position.x-R<col.max.x&&
+       player.position.y+R>col.min.y&&player.position.y-R<col.max.y&&
+       player.position.z+R>col.min.z&&player.position.z-R<col.max.z){
+
+      const oT=(player.position.y+R)-col.min.y;
+      const oBot=col.max.y-(player.position.y-R);
+      if(oT<oBot){player.position.y=col.min.y-R;if(player.velocity.y>0)player.velocity.y*=-0.08;}
+      else{player.position.y=col.max.y+R;if(player.velocity.y<0){player.velocity.y*=-0.08;player.velocity.x*=0.85;player.velocity.z*=0.85;player.onGround=true;}}
+    }
+  }
+
+  // Reset if fell
+  if(player.position.y<-5)resetPlayer();
+
+  // Update camera
+  if(!renderer.xr.isPresenting){
+    camera.position.copy(player.position);
+    const fx=Math.sin(desktopYaw)*Math.cos(desktopPitch);
+    const fy=Math.sin(desktopPitch);
+    const fz=Math.cos(desktopYaw)*Math.cos(desktopPitch);
+    camera.lookAt(player.position.x+fx,player.position.y+fy,player.position.z+fz);
+  }
+
+  // Update body mesh
+  bodyMesh.position.set(player.position.x,player.position.y-0.3,player.position.z);
+  headMesh.position.set(player.position.x,player.position.y+0.25,player.position.z);
+
+  // Room name
+  const px=player.position.x,pz=player.position.z;
+  let rn='SPAWN ROOM';
+  if(px>250*S)rn='FACILITY HALLWAY';
+  if(px>350*S&&pz<75*S)rn='POOL ROOM';
+  if(pz>250*S&&px<175*S)rn='SHELF ROOM';
+  if(pz>350*S&&px<680*S)rn='LOWER HALLWAY';
+  if(px>650*S&&pz<200*S)rn='MAIN ARENA';
+  if(px>650*S&&pz>200*S&&px<730*S)rn='RED DOOR CORRIDOR';
+  if(px>730*S)rn='PORTAL ROOM';
+  document.getElementById('roomTag').textContent=rn;
+  document.getElementById('stats').textContent='SPD:'+Math.sqrt(player.velocity.x**2+player.velocity.y**2+player.velocity.z**2).toFixed(1)+' | '+
+    (renderer.xr.isPresenting?'VR':'DESKTOP');
+}
+
+// --- Portal animation ---
+function animatePortal(time){
+  portalMesh.material.opacity=0.2+Math.sin(time*0.002)*0.1;
+  portalLight.intensity=1.5+Math.sin(time*0.003)*0.5;
+  portalMesh.rotation.y=time*0.001;
+}
+
+// --- Main loop ---
+let lastTime=0;
+function animate(time){
+  const delta=Math.min((time-lastTime)/1000,0.1);
+  lastTime=time;
+
+  updateControllers(time,delta);
+  updateDesktop(delta);
+  updatePhysics(delta);
+  animatePortal(time);
+
+  renderer.render(scene,camera);
+}
+
+renderer.setAnimationLoop(animate);
+
+// Resize
+window.addEventListener('resize',()=>{
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+</script>
+</body>
+</html>
